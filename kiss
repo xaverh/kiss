@@ -637,10 +637,14 @@ pkg_build() {
     for pkg do pkg_sources "$pkg"; done
     pkg_verify "$@"
 
+    # Record the total number of packages under a variable so that they are
+    # accessible to hooks.
+    pkg_total=$#
+
     # Finally build and create tarballs for all passed packages and
     # dependencies.
     for pkg do
-        log "$pkg" "Building package ($((in+=1))/$#)"
+        log "$pkg" "Building package ($((pkg_cur+=1))/$pkg_total)"
 
         run_hook pre-extract "$pkg" "$pkg_dir/$pkg"
         pkg_extract "$pkg"
