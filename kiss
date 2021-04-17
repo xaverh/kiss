@@ -647,14 +647,17 @@ pkg_build() {
     # Install any pre-built dependencies if they exist in the binary
     # directory and are up to date.
     for pkg do
-        ! contains "$explicit_build" "$pkg" && pkg_cache "$pkg" && {
+        if ! contains "$explicit_build" "$pkg" && pkg_cache "$pkg"; then
             log "$pkg" "Found pre-built binary, installing"
             (KISS_FORCE=1 args i "$tar_file")
-
-            # Remove the now installed package from the build list.
-            shift
-        }
+        else
+            remaining_pkgs=" $remaining_pkgs $pkg"
+        fi
     done
+
+    # See [1] at top of script.
+    # shellcheck disable=2046,2086
+    set -- $remaining_pkgs
 
     for pkg do pkg_sources "$pkg"; done
     pkg_verify "$@"
