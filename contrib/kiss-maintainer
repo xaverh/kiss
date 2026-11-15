@@ -3,16 +3,14 @@
 
 # Use the current directory as the package name if no package is given.
 [ "$1" ] || {
-    export KISS_PATH=${PWD%/*}:$KISS_PATH
+    export KISS_PATH="${PWD%/*}:$KISS_PATH"
     set -- "${PWD##*/}"
 }
 
-kiss search "$@" | uniq -u | while read -r repo; do cd "$repo"
-    m=$(git log -1 version 2>/dev/null) ||:
-    m=${m##*Author: }
-    m=${m%%>*}
+kiss search "$@" | sort -u | while read -r repo; do cd "$repo"
+    m=$(git log -1 --format='%an <%ae>' -- version 2>/dev/null) ||:
 
     [ "$m" ] || continue
 
-    printf '=> %s\n%s>\n' "$PWD" "$m"
+    printf '=> %s\n%s\n' "$PWD" "$m"
 done

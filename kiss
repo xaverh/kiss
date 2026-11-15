@@ -94,9 +94,7 @@ prompt() {
     null "$1" || log "$1"
 
     log "Continue?: Press Enter to continue or Ctrl+C to abort"
-
-    # korn-shell does not exit on interrupt of read.
-    equ "$KISS_PROMPT" 0 || read -r _ || exit 1
+    equ "$KISS_PROMPT" 0 || dd bs=1 count=1 >/dev/null 2>&1 || exit 1
 }
 
 mkcd() {
@@ -177,25 +175,79 @@ run_hook() {
 
 run_hook_pkg() {
     # Run a hook from the package's database files.
-    if [ -x "$sys_db/$2/$1" ]; then
+    hook_path="$sys_db/$2/$1"
+    if [ -x "$hook_path" ]; then
         log "$2" "Running $1 hook"
-        "$sys_db/$2/$1"
 
-    elif [ -f "$sys_db/$2/$1" ]; then
+        user=root
+
+        set --
+        equ "$LOGNAME" "$user" || set -- as_user
+
+        "$@" env KISS_ROOT='' \
+            chroot "${KISS_ROOT:-/}" "${hook_path#"$KISS_ROOT"}"
+
+    elif [ -f "$hook_path" ]; then
         war "$2" "skipping $1 hook: not executable"
     fi
 }
 
+compress() {
+    case $KISS_COMPRESS in
+        bz2)  bzip2 -c  ;;
+        gz)   gzip  -c  ;;
+        lz)   lzip  -c  ;;
+        lzma) lzma -cT0 ;;
+        xz)   xz   -cT0 ;;
+        zst)  zstd -cT0 ;;
+    esac
+}
+
 decompress() {
     case $1 in
-        *.tbz|*.bz2) bzip2 -d ;;
-        *.lzma)      lzma -dc ;;
-        *.lz)        lzip -dc ;;
-        *.tar)       cat      ;;
-        *.tgz|*.gz)  gzip -d  ;;
-        *.xz|*.txz)  xz -dc ;;
-        *.zst)       zstd -dc ;;
+        *.tar)       cat        ;;
+        *.tbz|*.bz2) bzip2 -dc  ;;
+        *.lz)        lzip  -dc  ;;
+        *.tgz|*.gz)  gzip  -dc  ;;
+        *.lzma)      lzma -dcT0 ;;
+        *.xz|*.txz)  xz   -dcT0 ;;
+        *.zst)       zstd -dcT0 ;;
     esac < "$1"
+}
+
+b3() {
+    # Higher level blake3 function which filters out non-existent
+    # files (and also directories).
+    for f do shift
+        [ -d "$f" ] || [ ! -e "$f" ] || set -- "$@" "$f"
+    done
+
+    _b3 "$@"
+}
+
+_b3() {
+    unset hash
+
+    # Skip generation if no arguments.
+    ! equ "$#" 0 || return 0
+
+    IFS=$newline
+
+    # Generate checksums for all input files. This is a single
+    # call to the utility rather than one per file.
+    #
+    # The length of the checksum is set to 33 bytes to
+    # differentiate it from sha256 checksums.
+    _hash=$("$cmd_b3" -l 33 "$@") || die "Failed to generate checksums"
+
+    # Strip the filename from each element.
+    # '<checksum> ?<file>' -> '<checksum>'
+    for sum in $_hash; do
+        hash=$hash${hash:+"$newline"}${sum%% *}
+    done
+
+    printf '%s\n' "$hash"
+    unset IFS
 }
 
 sh256() {
@@ -262,15 +314,6 @@ pkg_find_version() {
         die "$pkg" "Build file not found or not executable"
 }
 
-pkg_find_version_split() {
-    pkg_find_version "$@"
-
-    # Split the version on '.+-_' to obtain individual components.
-    IFS=.+-_ read -r repo_major repo_minor repo_patch repo_ident <<EOF
-$repo_ver
-EOF
-}
-
 pkg_find() {
     _pkg_find "$@" || die "'$1' not found"
 }
@@ -285,6 +328,7 @@ _pkg_find() {
     # Intentional.
     # shellcheck disable=2086
     for _find_path in $4 "${3:-$sys_db}"; do set +f
+        ok "$_find_path" || continue
         for _find_pkg in "$_find_path/"$1; do
             test "${3:--d}" "$_find_pkg" && set -f -- "$@" "$_find_pkg"
         done
@@ -335,24 +379,11 @@ pkg_cache() {
 pkg_source_resolve() {
     # Given a line of input from the sources file, return an absolute
     # path to the source if it already exists, error if not.
-    unset _res _des _fnr
+    unset _res _des
 
     ok "${2##\#*}" || return 0
 
-    # Surround each replacement with substitutions to handled escaped markers.
-    # First substitution turns '\MARKER' into ' ' (can't appear in sources as
-    # they're already split on whitespace), second replaces 'MARKER' with its
-    # value and the third, turns ' ' into 'MARKER' (dropping \\).
-    fnr "${2%"${2##*[!/]}"}" \
-        \\VERSION \  VERSION "$repo_ver"   \  VERSION \
-        \\RELEASE \  RELEASE "$repo_rel"   \  RELEASE \
-        \\MAJOR   \  MAJOR   "$repo_major" \  MAJOR \
-        \\MINOR   \  MINOR   "$repo_minor" \  MINOR \
-        \\PATCH   \  PATCH   "$repo_patch" \  PATCH \
-        \\IDENT   \  IDENT   "$repo_ident" \  IDENT \
-        \\PACKAGE \  PACKAGE "$repo_name"  \  PACKAGE
-
-    set -- "$1" "$_fnr" "${3%"${3##*[!/]}"}" "$4"
+    set -- "$1" "$2" "${3%"${3##*[!/]}"}" "$4"
 
     # Git repository.
     if null "${2##git+*}"; then
@@ -360,14 +391,18 @@ pkg_source_resolve() {
         _des=$src_dir/$1/${3:+"$3/"}${2##*/}
         _des=${_des%[@#]*}/
 
-    # Remote source (cached).
-    elif [ -f "$src_dir/$1/${3:+"$3/"}${2##*/}" ]; then
-        _res=$src_dir/$1/${3:+"$3/"}${2##*/}
-
     # Remote source.
     elif null "${2##*://*}"; then
-        _res=url+$2
-        _des=$src_dir/$1/${3:+"$3/"}${2##*/}
+        # Remote source (cached).
+        # Only check if we detect a remote source to avoid
+        # masking local paths like 'files/test' as cached
+        # if '$src_dir/$1/test' is present
+        if [ -f "$src_dir/$1/${3:+"$3/"}${2##*/}" ]; then
+            _res=$src_dir/$1/${3:+"$3/"}${2##*/}
+        else
+            _res=url+$2
+            _des=$src_dir/$1/${3:+"$3/"}${2##*/}
+        fi
 
     # Local relative dir.
     elif [ -d "$repo_dir/$2" ]; then
@@ -395,7 +430,7 @@ pkg_source_resolve() {
 pkg_source() {
     # Download any remote package sources. The existence of local files is
     # also checked.
-    pkg_find_version_split "$1"
+    pkg_find_version "$1"
 
     # Support packages without sources. Simply do nothing.
     [ -f "$repo_dir/sources" ] || return 0
@@ -407,9 +442,8 @@ pkg_source() {
 
         # arg1: pre-source
         # arg2: package name
-        # arg3: verbatim source
-        # arg4: resolved source
-        run_hook pre-source "$1" "$src" "$_fnr"
+        # arg3: source
+        run_hook pre-source "$1" "$src"
 
         # '$2' is set when this function is called from 'kiss c' and it is used
         # here to skip calling the Git code.
@@ -420,8 +454,8 @@ pkg_source() {
 
         # arg1: post-source
         # arg2: package name
-        # arg3: verbatim source
-        # arg4: resolved source
+        # arg3: source
+        # arg4: destination
         run_hook post-source "$1" "$src" "${_des:-"$_res"}"
     done < "$repo_dir/sources"
 }
@@ -429,22 +463,36 @@ pkg_source() {
 pkg_source_url() {
     log "$repo_name" "Downloading $2"
 
+    # Download to a temporary file and only move it to the destination if
+    # everything completed successfully, to avoid leaving incomplete downloads
+    # in the cache if it is interrupted.
+    download_source=$2
+    download_dest=$1
+    tmp_file "${1##*/}" download
+    shift
+
+    set -- "$_tmp_file" "$@"
+    rm -f "$_tmp_file"
+
     # Set the arguments based on found download utility.
     case ${cmd_get##*/} in
-        aria2c|axel) set -- -o   "$@" ;;
-               curl) set -- -fLo "$@" ;;
-         wget|wget2) set -- -O   "$@" ;;
+            aria2c) set -- -d / -o  "$@" ;;
+              axel) set -- -o       "$@" ;;
+              curl) set -- -fLo     "$@" ;;
+        wget|wget2) set -- -O       "$@" ;;
     esac
 
     "$cmd_get" "$@" || {
-        rm -f "$2"
-        die "$repo_name" "Failed to download $3"
+        rm -f "$_tmp_file"
+        die "$repo_name" "Failed to download $download_source"
     }
+
+    mv "$_tmp_file" "$download_dest"
 }
 
 pkg_source_git() {
     com=${2##*[@#]}
-    com=${com#${2%[#@]*}}
+    com=${com#"${2%[#@]*}"}
 
     log "$repo_name" "Checking out ${com:-FETCH_HEAD}"
 
@@ -496,7 +544,7 @@ pkg_source_tar() {
             -exec sh -c 'mv -f "$0" "$@" .' {} + 2>/dev/null ||
 
         find "$KISS_PID-$dir/." ! -name . -prune \
-            -exec sh -c 'cp -fRp "$0" "$@" .' {} +
+            -exec sh -c 'cp -fRPp "$0" "$@" .' {} +
 
         # Remove the directory now that all files have been
         # transferred out of it. This can't be a simple 'rmdir'
@@ -528,7 +576,7 @@ pkg_extract() {
 
         case $_res in
             git+*)
-                cp -LRf "$_des/." .
+                cp -PRf "$_des/." .
             ;;
 
             *.tar|*.tar.??|*.tar.???|*.tar.????|*.t?z)
@@ -536,7 +584,7 @@ pkg_extract() {
             ;;
 
             *?*)
-                cp -LRf "$_res" .
+                cp -PRf "$_res" .
             ;;
         esac
     done < "$repo_dir/sources" || die "$1" "Failed to extract $_res"
@@ -646,6 +694,25 @@ pkg_strip() {
     esac done < "$pkg_dir/$1/$pkg_db/$1/manifest" || :
 }
 
+should_ignore_rpath() {
+    # Intentional, globbing disabled.
+    # shellcheck disable=2086
+    { IFS=:; set -- $1; unset IFS; }
+
+    for path do
+        # TODO maybe check if the RPATH is set to a redundant value
+        # like /lib or /usr/lib ?
+        # ORIGIN is relative - no need to ignore it.
+        # Library rpath: [$ORIGIN/../lib]
+        # shellcheck disable=2016
+        case $path in '$ORIGIN'*|'${ORIGIN}'*) continue; esac
+        # Non-relative path, should be ignored.
+        return 0
+    done
+
+    return 1
+}
+
 pkg_fix_deps() {
     # Dynamically look for missing runtime dependencies by checking each
     # binary and library with 'ldd'. This catches any extra libraries and or
@@ -669,28 +736,71 @@ pkg_fix_deps() {
         */sbin/?*[!/]|*/bin/?*[!/]|*/lib/?*[!/]|\
         */lib??/?*[!/]|*/lib???/?*[!/]|*/lib????/?*[!/])
 
-        # The readelf mode requires ldd's output to resolve the library
-        # path for a given file. If ldd fails, silently skip the file.
-        ldd=$(ldd -- "$pkg_dir/$repo_name$_file" 2>/dev/null) || continue
+        unset elf
 
         # Attempt to get information from readelf. If this fails (or we
         # are in ldd mode), do full ldd mode (which has the downside of
         # listing dependencies of dependencies (and so on)).
-        elf=$("$cmd_elf" -d "$pkg_dir/$repo_name$_file" 2>/dev/null) || elf=$ldd
+        case $cmd_elf in *readelf)
+            elf=$("$cmd_elf" -d "$pkg_dir/$repo_name$_file" 2>/dev/null) ||:
+        esac
+
+        # RPATH/RUNPATH allows the binary to set a relative path for the
+        # dynamic loader that might not be present on the rootfs at the time
+        # of installation. So, ignoring it can cause the dependency detector to
+        # wrongly add packages. The problem also exists in reverse when the
+        # package links to a library bundled inside it and present in system paths
+        # aswell, and a package update unbundles it - the package gets a dependency
+        # on itself due to RPATH causing ldd to find the bundled lib.
+        # Example: libnss3.so exists in /usr/lib at the time of installation
+        # But the package links to libnss3 in /usr/lib/PKG/libnss3.so, which is
+        # present only in the build dir. So, KISS wrongly adds the installed nss
+        # as a dependency.
+        # To avoid dealing with this, we just ignore any libraries with RPATH set.
+        # A solution to this could be to just get the NEEDED libs and RPATH with
+        # readelf and resolve the paths ourselves - with adhoc logic for RPATH and
+        # the build dir.
+        # Another solution could be to resolve the dependencies after installation,
+        # but that can cause issues with reinstalling that tarball later on.
+        # https://github.com/kiss-community/kiss/issues/64
+        # https://github.com/kiss-community/repo/issues/97
+        while read -r _ entry_type value; do
+            # Technically RUNPATH is supposed to have a higher priority
+            # than RPATH but a binary that has both RPATH and RUNPATH set,
+            # each with unique values is probably broken...
+            case $entry_type in '(RPATH)'|'(RUNPATH)')
+                value=${value##*\[}
+                value=${value%%\]*}
+
+                should_ignore_rpath "$value" && continue 2
+                # Found RPATH which shouldn't be ignored
+                break
+            esac
+        done <<EOF
+$elf
+EOF
+
+        # The readelf mode requires ldd's output to resolve the library
+        # path for a given file. If ldd fails, silently skip the file.
+        ldd=$(ldd -- "$pkg_dir/$repo_name$_file" 2>/dev/null) || continue
+        ok "$elf" || elf=$ldd
 
         # Iterate over the output of readelf or ldd, extract file names,
         # resolve their paths and finally, figure out their owner.
-        while read -r lib; do case $lib in *NEEDED*\[*\]|*'=>'*)
+        while read -r _ entry_type lib; do case $entry_type in '(NEEDED)'|'=>')
             # readelf: 0x0000 (NEEDED) Shared library: [libjson-c.so.5]
             lib=${lib##*\[}
             lib=${lib%%\]*}
 
-            # Resolve library path.
+            # Resolve library path. It is already resolved for ldd in the 'lib' field
             # ldd: libjson-c.so.5 => /lib/libjson-c.so.5 ...
-            case $cmd_elf in
-                *readelf) lib=${ldd#*"	$lib => "} ;;
-                *)        lib=${lib##*=> } ;;
+            case $cmd_elf in *readelf)
+                lib=${ldd#*"	$lib => "}
+                # Remove prefix, else the file will not be owned by any
+                # package in the pkg_owner check below
+                lib=${lib#"$pkg_dir/$repo_name"}
             esac
+
             lib=${lib%% *}
 
             # Skip files owned by libc, libc++ and POSIX.
@@ -788,16 +898,17 @@ pkg_manifest_validate() {
     # NOTE: _pkg comes from caller.
     log "$_pkg" "Checking if manifest valid"
 
+    cnt=0
+
     while read -r line; do
         [ -e "$tar_dir/$_pkg$line" ] || [ -h "$tar_dir/$_pkg$line" ] || {
             printf '%s\n' "$line"
-            set -- "$@" "$line"
+            : $((cnt += 1))
         }
     done < "$pkg_db/$_pkg/manifest"
 
-    for f do
-        die "$_pkg" "manifest contains $# non-existent files"
-    done
+    equ "$cnt" 0 ||
+        die "$_pkg" "manifest contains $cnt non-existent files"
 }
 
 pkg_manifest_replace() {
@@ -824,12 +935,19 @@ pkg_etcsums() {
     # Minor optimization - skip packages without /etc/.
     [ -d "$pkg_dir/$repo_name/etc" ] || return 0
 
-    # Create a list of all files in etc but do it in reverse.
     while read -r etc; do case $etc in /etc/*[!/])
-        set -- "$pkg_dir/$repo_name/$etc" "$@"
+        etc="$pkg_dir/$repo_name/$etc"
+        # Always use hash of /dev/null as the hash for symlinks as it's
+        # possible that they can never be resolved/hashed
+        # (eg. directory, non-existent path, ...)
+        # So they leave missing lines in etcsums which breaks removal of all
+        # other unmodified files in /etc aswell
+        [ -h "$etc" ] && etc=/dev/null
+
+        set -- "$@" "$etc"
     esac done < manifest
 
-    sh256 "$@" > etcsums
+    b3 "$@" > etcsums
 }
 
 pkg_tar() {
@@ -846,14 +964,7 @@ pkg_tar() {
     cd "$pkg_dir/$1"
 
     # Create a tarball from the contents of the built package.
-    tar cf - . | case $KISS_COMPRESS in
-        bz2)  bzip2 -z ;;
-        gz)   gzip -6  ;;
-        lzma) lzma -z  ;;
-        lz)   lzip -z  ;;
-        xz)   xz -z  ;;
-        zst)  zstd -z  ;;
-    esac > "$_tar_file"
+    tar cf - . | compress > "$_tar_file"
 
     cd "$OLDPWD"
 
@@ -872,7 +983,7 @@ pkg_build_all() {
     # Mark packages passed on the command-line explicit.
     # Also resolve dependencies for all explicit packages.
     for pkg do
-        pkg_depends "$pkg" expl filter
+        equ "$KISS_FORCE" 1 || pkg_depends "$pkg" expl filter
         explicit="$explicit $pkg "
     done
 
@@ -928,13 +1039,13 @@ pkg_build_all() {
     for pkg do
         log "$pkg" "Building package ($((_build_cur+=1))/$#)"
 
-        pkg_find_version_split "$pkg"
+        pkg_find_version "$pkg"
 
         # arg1: queue-status
         # arg2: package name
         # arg3: number in queue
         # arg4: total in queue
-        run_hook queue "$pkg" "$_build_cur" "$#"
+        run_hook queue-status "$pkg" "$_build_cur" "$#"
 
         ! [ -f "$repo_dir/sources" ] || pkg_extract  "$pkg"
 
@@ -986,16 +1097,14 @@ pkg_build() {
         # Give the script a modified environment. Define toolchain program
         # environment variables assuming a generic environment by default.
         #
-        # Define DESTDIR and GOPATH to sane defaults as their use is mandatory
-        # in anything using autotools, meson, cmake, etc. Define KISS_ROOT as
-        # the sanitized value used internally by the package manager. This is
-        # safe to join with other paths.
+        # Define GOPATH to sane defaults as its use is mandatory for Go projects.
+        # Define KISS_ROOT as the sanitized value used internally by the package
+        # manager. This is safe to join with other paths.
         AR="${AR:-ar}" \
         CC="${CC:-cc}" \
         CXX="${CXX:-c++}" \
         NM="${NM:-nm}" \
         RANLIB="${RANLIB:-ranlib}" \
-        DESTDIR="$pkg_dir/$1" \
         RUSTFLAGS="--remap-path-prefix=$PWD=. $RUSTFLAGS" \
         GOFLAGS="-trimpath -modcacherw $GOFLAGS" \
         GOPATH="$PWD/go" \
@@ -1058,7 +1167,7 @@ pkg_checksum_gen() {
         esac
     done < "$repo_dir/sources"
 
-    _sh256 "$@"
+    _b3 "$@"
 }
 
 pkg_verify() {
@@ -1078,6 +1187,13 @@ pkg_verify() {
     # Check that the first column (separated by whitespace) match in both
     # checksum files. If any part of either file differs, mismatch. Abort.
     null "$1" || while read -r chk _ || ok "$1"; do
+        equ "${#chk}" 64 && {
+            log "$repo_name" "Detected sha256 checksums." ERROR
+            log "blake3 is the new checksum provider for kiss. Please run"
+            log "'kiss checksum $repo_name' to regenerate the checksums file."
+            return 1
+        }
+
         printf '%s\n%s\n' "- ${chk:-missing}" "+ ${1:-no source}"
 
         equ "$1-${chk:-null}" "$chk-$1" ||
@@ -1202,6 +1318,27 @@ pkg_alternatives() {
     fi
 }
 
+pkg_preferred() {
+    cd "$sys_db"
+
+    # We only respect first argument
+    if ok "$1"; then
+        [ -d "$1" ] || die "'$1' not found"
+        set -- "$1/manifest"
+    else
+        set +f; set -f -- */manifest
+    fi
+
+    # Pass /dev/null to grep to always ensure that the file name
+    # is printed even if we have a single file
+    pkg_alternatives |
+        cut -d' ' -f2- |
+        grep -Fxf - "$@" /dev/null |
+        sed 's/\/manifest:/ /'
+
+    cd "$OLDPWD"
+}
+
 pkg_swap() {
     # Swap between package alternatives.
     [ -d "$sys_db/$1" ] || die "'$1' not found"
@@ -1218,8 +1355,9 @@ pkg_swap() {
         log "Swapping '$2' from '$_owns' to '$1'"
 
         # Convert the current owner to an alternative and rewrite its manifest
-        # file to reflect this.
+        # file to reflect this. Also ensure that timestamps are preserved.
         cp -Pf "$KISS_ROOT$2" "$sys_ch/$_owns>${_fnr#*>}"
+        ! [ -h "$KISS_ROOT$2" ] && touch -r "$KISS_ROOT$2" "$sys_ch/$_owns>${_fnr#*>}"
         pkg_manifest_replace "$_owns" "$2" "/$cho_db/$_owns>${_fnr#*>}"
     fi
 
@@ -1245,6 +1383,10 @@ file_rwx() {
         case $rwx in
             [rwx]*) o=$((o + ${c#?})) ;;
              [st]*) o=$((o + 1)) ;;
+        esac
+
+        case $rwx in
+            [tT]*) oct=1$oct
         esac
 
         case $((${c%?} % 3)) in 0)
@@ -1297,6 +1439,9 @@ pkg_install_files() {
                 # temporary name created above.
                 cp -fP "$2$file" "$__tmp" &&
 
+                # Ensure timestamps are preserved.
+                if ! [ -h "$2$file" ]; then touch -r "$2$file" "$__tmp"; fi &&
+
                 # Atomically move the temporary file to its final
                 # destination. The running processes will either get
                 # the old file or the new one.
@@ -1311,9 +1456,12 @@ pkg_remove_files() {
     # functions allows us to stop duplicating code.
     while read -r file; do
         case $file in /etc/?*[!/])
-            sh256 "$KISS_ROOT/$file" >/dev/null
-
             read -r sum_pkg <&3 ||:
+
+            case "${#sum_pkg}" in
+                64) sh256 "$KISS_ROOT/$file" >/dev/null ;;
+                *)  b3    "$KISS_ROOT/$file" >/dev/null ;;
+            esac
 
             equ "$hash" "$sum_pkg" || {
                 printf 'Skipping %s (modified)\n' "$file"
@@ -1346,12 +1494,15 @@ pkg_remove_files() {
 }
 
 pkg_etc() {
-    sh256 "$tar_dir/$_pkg$file" "$KISS_ROOT$file" >/dev/null
+    read -r sum_old <&3 2>/dev/null ||:
+
+    case "${#sum_old}" in
+        64) sh256 "$tar_dir/$_pkg$file" "$KISS_ROOT$file" >/dev/null ;;
+        *)  b3    "$tar_dir/$_pkg$file" "$KISS_ROOT$file" >/dev/null ;;
+    esac
 
     sum_new=${hash%%"$newline"*}
     sum_sys=${hash#*"$newline"}
-
-    read -r sum_old <&3 2>/dev/null ||:
 
     # Compare the three checksums to determine what to do.
     case ${sum_old:-null}${sum_sys:-null}${sum_new} in
@@ -1390,6 +1541,14 @@ pkg_removable() {
 
     set -f
     cd "$OLDPWD"
+
+    # Check if a package would leave dangling "orphaned" alternatives.
+    tmp_file "$1" owned-conflicts
+    pkg_preferred "$1" | tee "$_tmp_file"
+
+    cnt=$(wc -l < "$_tmp_file")
+    equ "$cnt" 0 ||
+        die "$1" "Not removable, package leaves behind $cnt orphaned alternatives"
 }
 
 pkg_remove() {
@@ -1577,7 +1736,8 @@ pkg_update() {
 
     # Update each repository in '$KISS_PATH'.
     for repo do
-        if git -C "$repo" rev-parse 'HEAD@{upstream}' >/dev/null 2>&1; then
+        ok "$repo" || continue
+        if git -C "$repo" rev-parse 'HEAD@{upstream}' >/dev/null; then
             repo_type=git
 
             # Get the Git repository root directory.
@@ -1594,7 +1754,7 @@ pkg_update() {
         pkg_update_repo
     done
 
-    pkg_upgrade
+    log "Run 'kiss U' to upgrade packages"
 }
 
 pkg_update_repo() {
@@ -1623,6 +1783,11 @@ pkg_update_repo() {
         # arg1: post-update
         # env:  PWD is path to repository
         run_hook post-update
+
+        [ ! -r MOTD ] || {
+            log "$PWD" "Printing MOTD"
+            cat MOTD
+        }
     }
 }
 
@@ -1717,7 +1882,7 @@ pkg_help_ext() {
     #
     # This also removes any duplicates found in '$PATH', picking the
     # first match.
-    for path do 
+    for path do
         p=${path#*/kiss-}
 
         case " $seen " in *" $p "*)
@@ -1777,7 +1942,7 @@ args() {
     # Ensure that arguments do not contain invalid characters. Wildcards can
     # not be used here as they would conflict with kiss extensions.
     case $action in
-        a|alternatives)
+        a|alternatives|p|preferred)
             case $1 in *\**|*\!*|*\[*|*\ *|*\]*|*/*|*"$newline"*)
                 die "Invalid argument: '!*[ ]/\\n' ($1)"
             esac
@@ -1799,7 +1964,7 @@ args() {
             # of the current directory as the package name and add the parent
             # directory to the running process' KISS_PATH.
             case ${action%%"${action#?}"}-$# in [!l]-0)
-                export KISS_PATH=${PWD%/*}:$KISS_PATH
+                export KISS_PATH="${PWD%/*}:$KISS_PATH"
                 set -- "${PWD##*/}"
             esac
 
@@ -1807,7 +1972,7 @@ args() {
             # files may differ when repositories change. Removal is not dependent on
             # the state of the repository.
             case $action in r|remove)
-                export KISS_PATH=$sys_db:$KISS_PATH
+                export KISS_PATH="$sys_db:$KISS_PATH"
             esac
 
             # Order the argument list based on dependence.
@@ -1832,18 +1997,21 @@ args() {
         if ok "$1" && ! am_owner "$KISS_ROOT/"; then
             trap_off
 
+            cd "$ppwd"
             as_user env \
                 LOGNAME="$user" \
                 HOME="$HOME" \
                 XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-                KISS_COMPRESS="$KISS_COMPRESS" \
-                KISS_PATH="$KISS_PATH" \
-                KISS_FORCE="$KISS_FORCE" \
-                KISS_ROOT="$KISS_ROOT" \
                 KISS_CHOICE="$KISS_CHOICE" \
                 KISS_COLOR="$KISS_COLOR" \
-                KISS_TMPDIR="$KISS_TMPDIR" \
+                KISS_COMPRESS="$KISS_COMPRESS" \
+                KISS_FORCE="$KISS_FORCE" \
+                KISS_HOOK="$KISS_HOOK" \
+                KISS_PATH="$KISS_PATH" \
                 KISS_PID="$KISS_PID" \
+                KISS_ROOT="$KISS_ROOT" \
+                KISS_TMPDIR="$KISS_TMPDIR" \
+                _KISS_DATE="$time" \
                 _KISS_LVL="$_KISS_LVL" \
                 "$0" "$action" "$@"
 
@@ -1862,23 +2030,25 @@ args() {
         H|help-ext)     pkg_help_ext "$@" ;;
         i|install)      for pkg do pkg_install "$pkg"; done ;;
         l|list)         pkg_list_version "$@" ;;
+        p|preferred)    pkg_preferred "$@" ;;
         r|remove)       for pkg in $redro; do pkg_remove "$pkg"; done ;;
         s|search)       for pkg do pkg_find "$pkg" all; done ;;
         u|update)       pkg_update ;;
         U|upgrade)      pkg_upgrade ;;
-        v|version)      printf '5.5.28\n' ;;
+        v|version)      printf '6.2.0\n' ;;
 
         '')
-            log 'kiss [a|b|c|d|i|l|r|s|u|U|v] [pkg]...'
+            log 'kiss [a|b|c|d|i|l|p|r|s|u|U|v] [pkg]...'
             log 'alternatives List and swap alternatives'
             log 'build        Build packages'
             log 'checksum     Generate checksums'
             log 'download     Download sources'
             log 'install      Install packages'
             log 'list         List installed packages'
+            log 'preferred    List owners of files with alternatives'
             log 'remove       Remove packages'
             log 'search       Search for packages'
-            log 'update       Update the system and repositories'
+            log 'update       Update the repositories'
             log 'upgrade      Update the system'
             log 'version      Package manager version'
 
@@ -1890,7 +2060,7 @@ args() {
             # which call the package manager do not increment the value
             # further than the parent instance.
             pkg_find "kiss-$action*" "" -x "$PATH"
-            _KISS_LVL=0 "$repo_dir" "$@"
+            _KISS_LVL=0 KISS_PID='' "$repo_dir" "$@"
         ;;
     esac
 }
@@ -1972,6 +2142,9 @@ main() {
         command -v llvm-readelf
     )"} || cmd_elf=ldd
 
+    # b3sum is, for now, the only supported blake3 digest utility.
+    cmd_b3=b3sum
+
     # Figure out which sha256 utility is available.
     cmd_sha=${KISS_CHK:-"$(
         command -v openssl   ||
@@ -1979,7 +2152,7 @@ main() {
         command -v sha256    ||
         command -v shasum    ||
         command -v digest
-    )"} || die "No sha256 utility found"
+    )"} || war "No sha256 utility found"
 
     # Figure out which download utility is available.
     cmd_get=${KISS_GET:-"$(
@@ -1992,7 +2165,10 @@ main() {
 
     # Store the date and time of script invocation to be used as the name of
     # the log files the package manager creates during builds.
-    time=$(date +%Y-%m-%d-%H:%M)
+    # Accept _KISS_DATE in case this process has been called by a kiss process
+    # started on a different day, which could cause permission issues if we
+    # create log_dir as root.
+    time=${_KISS_DATE:-"$(date +%Y-%m-%d-%H:%M)"}
 
     create_tmp_dirs
     trap_on

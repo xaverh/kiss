@@ -26,12 +26,29 @@ EOF
     )
 
     case $remote in
+        age)
+            remote=age-encryption
+        ;;
+
         baseinit|baselayout|kiss)
             remote=-
         ;;
 
+
+        bat)
+            remote=bat-cat
+        ;;
+
+        cairo)
+            remote=cairo-graphics-library
+        ;;
+
         clang)
             remote=llvm
+        ;;
+
+        ctags)
+            remote=exuberant-ctags
         ;;
 
         dash)
@@ -46,13 +63,25 @@ EOF
             remote=dsp-audio-processing
         ;;
 
+        dust)
+            remote=du-dust
+        ;;
+
         emacs-nox)
             # TODO [community]: Make default emacs no x11?
             remote=emacs
         ;;
 
+        go-ipfs)
+            remote=ipfs
+        ;;
+
         fd)
             remote=fd-find
+        ;;
+
+        fdm)
+            remote=fdm-email-fetcher
         ;;
 
         fetsh)
@@ -88,7 +117,7 @@ EOF
         ;;
 
         gtk+3)
-            remote=gtk3+classic
+            remote=gtk3-classic
         ;;
 
         gst-*)
@@ -124,13 +153,29 @@ EOF
             remote=fonts:liberation
         ;;
 
+        libjpeg)
+            remote=ijg-libjpeg
+        ;;
+
         libmupdf | libxaw3d)
             # TODO [community]: Rename packages?
             remote=${remote##lib}
         ;;
 
+        libnghttp2)
+            remote=nghttp2
+        ;;
+
+        libportaudio2)
+            remote=portaudio
+        ;;
+
         libseat)
             remote=seatd
+        ;;
+
+        libzmq)
+            remote=zeromq
         ;;
 
         links2)
@@ -140,6 +185,10 @@ EOF
 
         linux-headers)
             remote=linux
+        ;;
+
+        lpeg)
+            remote=lua:lpeg
         ;;
 
         lux)
@@ -157,6 +206,14 @@ EOF
             remote=netsurf
         ;;
 
+        noto-emoji)
+            remote=fonts:noto-emoji
+        ;;
+
+        nq)
+            remote=nq-queue-utilities
+        ;;
+
         openjpeg2)
             # TODO [community]: Rename package?
             remote=openjpeg
@@ -166,13 +223,25 @@ EOF
             remote=oil-shell
         ;;
 
+        pass)
+            remote=password-store
+        ;;
+
         pinentry-dmenu)
             remote=pinentry-dmenu-cemkeylan
+        ;;
+
+        pybind11)
+            remote=python:pybind11
         ;;
 
         pyqt5)
             # TODO [community]: Rename package?
             remote=python-qt
+        ;;
+
+        python-*)
+            remote=python:${remote#*-}
         ;;
 
         python2)
@@ -184,7 +253,11 @@ EOF
         ;;
 
         rage)
-            remote=rage-encryption-tool
+            remote=rage-encryption
+        ;;
+
+        samurai)
+            remote=samurai-build-tool
         ;;
 
         sane)
@@ -199,6 +272,10 @@ EOF
             remote=fusefs:sshfs
         ;;
 
+        slides)
+            remote=slides-presentation-tool
+        ;;
+
         surf)
             remote=surf-browser
         ;;
@@ -211,16 +288,36 @@ EOF
             remote=sway
         ;;
 
+        tea)
+            remote=gitea-tea
+        ;;
+
         terminus-font)
             remote=fonts:terminus
         ;;
 
         tiv)
-            remote=tiv-unclassified
+            remote=tiv-terminalimageviewer
+        ;;
+
+        tree)
+            remote=tree-steve-baker
+        ;;
+
+        ttf-croscore)
+            remote=fonts:croscore
+        ;;
+
+        ttf-font-awesome)
+            remote=font-awesome6
         ;;
 
         unifont)
             remote=fonts:unifont
+        ;;
+
+        vis)
+            remote=vis-editor
         ;;
 
         webkit2gtk)
@@ -256,7 +353,7 @@ repo_version() {
 }
 
 get_outdated() {
-    repo=${repo%%/}
+    repo=${PWD%%/}
     printf '\n[Checking Repology for outdated packages in %s]\n\n' "$repo" >&2
 
     for pkg in */; do
@@ -270,7 +367,7 @@ get_outdated() {
 
     mkcd "$tmp/${repo##*/}"
 
-    curl -SsZ --parallel-max 16 --remote-name-all "$@" ||
+    curl -SsZA 'kiss-outdated' --parallel-max 16 --remote-name-all "$@" ||
         die 'fatal: network error'
 
     for _pkg in "$OLDPWD"/*/; do
@@ -281,8 +378,9 @@ get_outdated() {
         repology_name "$pkg"
         repology_version "$remote" || continue
 
-        case $remote_ver in *", $ver"* | *"$ver,"* | "$ver" | - | '')
-            continue
+        case $remote_ver in
+            *", $ver"* | *"$ver,"* | "$ver" | '') continue ;;
+            -) printf '%-30s no remote version found\n' "$pkg" >&2; continue ;;
         esac
 
         printf '%-30s %s -> %s\n' "$pkg" "$ver" "$remote_ver"
@@ -292,8 +390,7 @@ get_outdated() {
 main() {
     set -e
 
-    [ "$1" ] ||
-        die 'usage: kiss [ou]tdated /path/to/repo...'
+    [ "$1" ] || set -- "$PWD"
 
     mkdir -p "${tmp:=${XDG_CACHE_HOME:-"$HOME/.cache"}/kiss/repology}"
 
