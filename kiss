@@ -1241,8 +1241,8 @@ pkg_conflicts() {
 
     # Enable alternatives automatically if it is safe to do so.
     # This checks to see that the package that is about to be installed
-    # doesn't overwrite anything it shouldn't in '/var/db/kiss/installed'.
-    grep -q ":/var/db/kiss/installed/" "$_tmp_file" || safe=1
+    # doesn't overwrite anything it shouldn't in '/var/lib/kiss/installed'.
+    grep -q ":/var/lib/kiss/installed/" "$_tmp_file" || safe=1
 
     if ! equ "$KISS_CHOICE" 1 && equ "$safe" 1 && [ -s "$_tmp_file" ]; then
         # This is a novel way of offering an "alternatives" system.
@@ -1811,7 +1811,7 @@ pkg_upgrade() {
 
         # Detect repository orphans (installed packages with no
         # associated repository).
-        case $repo_dir in */var/db/kiss/installed/*)
+        case $repo_dir in */var/lib/kiss/installed/*)
             _repo_orp="$_repo_orp$newline${pkg##*/}"
         esac
 
@@ -2074,8 +2074,8 @@ create_tmp_dirs() {
     mkdir -p "$KISS_ROOT/" 2>/dev/null || :
 
     # System package database.
-    sys_db=$KISS_ROOT/${pkg_db:=var/db/kiss/installed}
-    sys_ch=$KISS_ROOT/${cho_db:=var/db/kiss/choices}
+    sys_db=$KISS_ROOT/${pkg_db:=var/lib/kiss/installed}
+    sys_ch=$KISS_ROOT/${cho_db:=var/lib/kiss/choices}
 
     # Top-level cache directory.
     cac_dir=${XDG_CACHE_HOME:-"${HOME%"${HOME##*[!/]}"}/.cache"}
@@ -2177,3 +2177,4 @@ main() {
 }
 
 main "$@"
+

@@ -26,7 +26,7 @@ esac
 # the match to our search.
 pkg_owns=$(grep -lFx \
     "${PWD#"$KISS_ROOT"}/${1##*/}" \
-    "$KISS_ROOT/var/db/kiss/installed/"*/manifest)
+    "$KISS_ROOT/var/lib/kiss/installed/"*/manifest)
 
 
 # Extract the package name from the path above.

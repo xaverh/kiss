@@ -4,7 +4,7 @@
 n='
 '
 
-cd "$KISS_ROOT/var/db/kiss/installed"
+cd "$KISS_ROOT/var/lib/kiss/installed"
 set -- *
 
 l=$n$(
@@ -38,4 +38,3 @@ for pkg do shift
 done
 
 printf '%s\n' "$@"
-
